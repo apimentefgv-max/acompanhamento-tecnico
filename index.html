@@ -174,7 +174,32 @@
     padding:4px 10px;border-radius:20px;letter-spacing:.2px;white-space:nowrap;
   }
   .class-tag{font-size:11px;color:var(--muted);font-weight:600;display:inline-flex;align-items:center;gap:4px;}
+  .checkpoint-tag{
+    font-size:11px;color:var(--navy);font-weight:600;background:var(--gray-bg);
+    border:1px solid var(--border);padding:2px 8px;border-radius:12px;display:inline-flex;align-items:center;gap:4px;
+  }
+  .origin-tag{
+    font-size:11px;color:var(--muted);font-weight:600;display:inline-flex;align-items:center;gap:4px;
+    cursor:pointer;text-decoration:underline;text-decoration-color:var(--border);text-underline-offset:2px;
+  }
+  .origin-tag:hover{color:var(--orange);text-decoration-color:var(--orange);}
   .card-arrow{align-self:center;color:var(--muted);font-size:18px;flex-shrink:0;}
+
+  .subject-card.selectable{cursor:pointer;}
+  .subject-card.selected{border-color:var(--orange);box-shadow:0 0 0 2px var(--orange-soft2) inset;}
+  .select-checkbox{
+    flex-shrink:0;width:20px;height:20px;border-radius:5px;border:2px solid var(--border);
+    margin-top:2px;display:flex;align-items:center;justify-content:center;
+    color:var(--white);font-size:13px;font-weight:800;transition:background .12s ease, border-color .12s ease;
+  }
+  .select-checkbox.checked{background:var(--orange);border-color:var(--orange);}
+
+  .selection-bar{
+    display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;
+    background:var(--orange-soft);border:1px solid var(--orange-soft2);border-radius:10px;
+    padding:12px 16px;margin-bottom:14px;
+  }
+  .selection-count{font-size:13.5px;font-weight:700;color:var(--navy);}
 
   .empty-state{
     background:var(--white);border:1px dashed var(--border);border-radius:12px;
@@ -516,6 +541,8 @@ function switchContext(ctx){
   view = 'home';
   modal = null;
   presentSlides = [];
+  selectionMode = false;
+  selectedForCheckpoint = new Set();
   render();
   window.scrollTo(0,0);
 }
@@ -619,16 +646,30 @@ let view = 'home';           // home | meetings | attention | meeting-detail | p
 let modal = null;            // { type, ... }
 let presentIndex = 0;
 let viewingMeetingId = null;
+let selectionMode = false;         // modo de seleção em lote (Quinzenal → Checkpoint)
+let selectedForCheckpoint = new Set();
 
 function setView(v, extra){
   view = v;
   modal = null;
+  if(v !== 'home'){ selectionMode = false; selectedForCheckpoint = new Set(); }
   if(extra && extra.meetingId) viewingMeetingId = extra.meetingId;
   render();
   window.scrollTo(0,0);
 }
 function openModal(m){ modal = m; render(); }
-function closeModal(){ modal = null; render(); }
+function closeModal(){ modal = null; checkpointCopyResult = null; render(); }
+
+function toggleSelectionMode(){
+  selectionMode = !selectionMode;
+  selectedForCheckpoint = new Set();
+  render();
+}
+function toggleSelectSubject(id){
+  if(selectedForCheckpoint.has(id)) selectedForCheckpoint.delete(id);
+  else selectedForCheckpoint.add(id);
+  render();
+}
 
 function showToast(msg){
   const t = document.getElementById('toast');
@@ -642,9 +683,12 @@ function showToast(msg){
 /* ============================================================
    Ações de CRUD
    ============================================================ */
-function nextOrderForClassification(cls){
-  const siblings = ctxData().subjects.filter(s=>s.classification===cls);
+function nextOrderForClassificationIn(ctx, cls){
+  const siblings = ctx.subjects.filter(s=>s.classification===cls);
   return siblings.reduce((max,s)=> typeof s.order==='number' ? Math.max(max, s.order+1) : max, 0);
+}
+function nextOrderForClassification(cls){
+  return nextOrderForClassificationIn(ctxData(), cls);
 }
 
 function upsertSubject(data, id){
@@ -686,6 +730,79 @@ function deleteSubject(id){
   ctxData().current.subjectIds = ctxData().current.subjectIds.filter(x=>x!==id);
   saveState();
   showToast('Assunto excluído.');
+}
+
+/* ============================================================
+   Cópia de assuntos: Reunião Quinzenal → Checkpoint
+   (cópia independente, não sincronizada; direção única)
+   ============================================================ */
+function checkpointCopiesOf(quinzenalSubjectId){
+  return state.contexts.checkpoint.subjects.filter(s=>s.originContext==='quinzenal' && s.originSubjectId===quinzenalSubjectId);
+}
+function latestCheckpointCopyDate(quinzenalSubjectId){
+  const copies = checkpointCopiesOf(quinzenalSubjectId);
+  if(!copies.length) return null;
+  return copies.reduce((max,c)=> (!max || c.copyMeetingDate > max) ? c.copyMeetingDate : max, null);
+}
+
+function copySubjectsToCheckpoint(subjectIds, checkpointDateISO){
+  const cp = state.contexts.checkpoint;
+  cp.current.date = checkpointDateISO;
+
+  const alreadyInTarget = new Set(
+    cp.current.subjectIds
+      .map(id=>cp.subjects.find(s=>s.id===id))
+      .filter(Boolean)
+      .filter(s=>s.originContext==='quinzenal')
+      .map(s=>s.originSubjectId)
+  );
+
+  const sourceDate = ctxData().current.date; // ctxData() aqui é o contexto ativo (Quinzenal), de onde partiu a cópia
+  const added = [], skipped = [];
+
+  subjectIds.forEach(srcId=>{
+    const src = getSubject(srcId);
+    if(!src) return;
+    if(alreadyInTarget.has(srcId)){ skipped.push(src.title); return; }
+
+    const copy = {
+      id: uid('s'),
+      ticket: src.ticket, title: src.title, area: src.area,
+      status: src.status, priority: src.priority, classification: src.classification,
+      forecast: src.forecast, lastUpdate: src.lastUpdate,
+      whatChanged: src.whatChanged, whatToHighlight: src.whatToHighlight, note: src.note,
+      createdAt: todayISO(),
+      order: nextOrderForClassificationIn(cp, src.classification),
+      timeline: [{date: fmtDate(todayISO()), text: 'Copiado da Reunião Quinzenal de ' + fmtDate(sourceDate) + '.'}],
+      originContext: 'quinzenal',
+      originSubjectId: src.id,
+      originLabel: 'Reunião Quinzenal - ' + fmtDate(sourceDate),
+      copyMeetingDate: checkpointDateISO
+    };
+    cp.subjects.push(copy);
+    cp.current.subjectIds.push(copy.id);
+    alreadyInTarget.add(srcId);
+    added.push(src.title);
+  });
+
+  saveState();
+  return { added, skipped, checkpointDate: checkpointDateISO };
+}
+
+function goToOrigin(originSubjectId){
+  const q = state.contexts.quinzenal;
+  if(q.current.subjectIds.includes(originSubjectId)){
+    switchContext('quinzenal');
+    openModal({type:'detail', id:originSubjectId});
+    return;
+  }
+  const meeting = q.meetings.find(m=>m.items.some(it=>it.id===originSubjectId));
+  if(meeting){
+    switchContext('quinzenal');
+    setView('meeting-detail', {meetingId: meeting.id});
+    return;
+  }
+  showToast('Não foi possível localizar a reunião de origem (o assunto pode ter sido excluído).');
 }
 
 function finalizeMeeting(){
@@ -808,9 +925,21 @@ function renderHeader(){
 function subjectCard(s){
   const st = STATUS_STYLE[s.status] || STATUS_STYLE['Pendente'];
   const cIcon = CLASS_ICON[s.classification] || '';
+  const inSelection = selectionMode && activeContext === 'quinzenal';
+  const isChecked = inSelection && selectedForCheckpoint.has(s.id);
+
+  const checkpointDate = (activeContext === 'quinzenal') ? latestCheckpointCopyDate(s.id) : null;
+  const checkpointTag = checkpointDate
+    ? `<span class="checkpoint-tag" title="Copiado para o Checkpoint de ${fmtDate(checkpointDate)}">🔗 Checkpoint ${fmtDate(checkpointDate)}</span>`
+    : '';
+
+  const originTag = (s.originContext === 'quinzenal')
+    ? `<span class="origin-tag" onclick="event.stopPropagation(); goToOrigin('${s.originSubjectId}')" title="Ver reunião de origem">↩ ${escapeHtml(s.originLabel)}</span>`
+    : '';
+
   return `
-  <div class="subject-card ${isAttention(s)?'attention':''}"
-       draggable="true"
+  <div class="subject-card ${isAttention(s)?'attention':''} ${inSelection?'selectable':''} ${isChecked?'selected':''}"
+       draggable="${inSelection ? 'false' : 'true'}"
        data-id="${s.id}"
        onclick="handleSubjectClick(event,'${s.id}')"
        ondragstart="onSubjectDragStart(event,'${s.id}')"
@@ -818,7 +947,9 @@ function subjectCard(s){
        ondragleave="onSubjectDragLeave(event)"
        ondrop="onSubjectDrop(event,'${s.id}')"
        ondragend="onSubjectDragEnd(event)">
-    <div class="drag-handle" title="Arrastar para reordenar dentro de '${escapeHtml(s.classification)}'">⠿</div>
+    ${inSelection
+      ? `<div class="select-checkbox ${isChecked?'checked':''}">${isChecked?'✓':''}</div>`
+      : `<div class="drag-handle" title="Arrastar para reordenar dentro de '${escapeHtml(s.classification)}'">⠿</div>`}
     <div class="dot ${dotColor(s)}"></div>
     <div class="subject-main">
       <div class="subject-top">
@@ -829,9 +960,11 @@ function subjectCard(s){
       <div class="subject-meta">
         <span class="badge" style="color:${st.color};background:${st.bg};border:1px solid ${st.border}">${s.status}</span>
         ${cIcon ? `<span class="class-tag">${cIcon} ${s.classification}</span>` : ''}
+        ${checkpointTag}
+        ${originTag}
       </div>
     </div>
-    <div class="card-arrow">›</div>
+    ${inSelection ? '' : '<div class="card-arrow">›</div>'}
   </div>`;
 }
 
@@ -840,11 +973,16 @@ let dragState = null;
 let suppressCardClick = false;
 
 function handleSubjectClick(event, id){
+  if(selectionMode && activeContext === 'quinzenal'){
+    toggleSelectSubject(id);
+    return;
+  }
   if(suppressCardClick){ suppressCardClick = false; return; }
   openModal({type:'detail', id});
 }
 
 function onSubjectDragStart(e, id){
+  if(selectionMode){ e.preventDefault(); return; }
   const s = getSubject(id);
   if(!s) return;
   dragState = { id, classification: s.classification };
@@ -934,25 +1072,36 @@ function renderHome(){
     <div class="section-head">
       <div>
         <div class="section-title">Assuntos em acompanhamento
-          <small>${meta.termCap} de ${fmtDate(ctxData().current.date)} • arraste ⠿ para reordenar dentro da mesma classificação</small>
+          <small>${meta.termCap} de ${fmtDate(ctxData().current.date)}${selectionMode ? '' : ' • arraste ⠿ para reordenar dentro da mesma classificação'}</small>
         </div>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <button class="btn btn-ghost btn-sm" onclick="openModal({type:'newmeeting'})">🗓 Novo(a) ${meta.term}</button>
-        <button class="btn btn-primary btn-sm" onclick="openModal({type:'form'})">+ Novo assunto</button>
+        ${activeContext==='quinzenal' && !selectionMode ? `<button class="btn btn-ghost btn-sm" onclick="toggleSelectionMode()">☑ Selecionar para Checkpoint</button>` : ''}
+        ${!selectionMode ? `<button class="btn btn-ghost btn-sm" onclick="openModal({type:'newmeeting'})">🗓 Novo(a) ${meta.term}</button>` : ''}
+        ${!selectionMode ? `<button class="btn btn-primary btn-sm" onclick="openModal({type:'form'})">+ Novo assunto</button>` : ''}
       </div>
     </div>
+
+    ${selectionMode ? `
+    <div class="selection-bar">
+      <div class="selection-count">${selectedForCheckpoint.size} assunto${selectedForCheckpoint.size===1?'':'s'} selecionado${selectedForCheckpoint.size===1?'':'s'}</div>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-ghost btn-sm" onclick="toggleSelectionMode()">Cancelar</button>
+        <button class="btn btn-primary btn-sm" ${selectedForCheckpoint.size===0?'disabled':''} onclick="openModal({type:'addtocheckpoint'})">Adicionar ao Checkpoint</button>
+      </div>
+    </div>` : ''}
 
     ${sorted.length ? `<div class="subjects-list">${sorted.map(subjectCard).join('')}</div>` :
       `<div class="empty-state"><div class="big">🗒</div>Nenhum assunto ${meta.term==='checkpoint'?'neste checkpoint':'nesta reunião'} ainda.<br>Cadastre o primeiro assunto para começar a pauta.</div>`}
 
+    ${!selectionMode ? `
     <div style="margin-top:32px;display:flex;justify-content:center;">
       <button class="btn btn-navy btn-lg" onclick="startPresentation()">▶ Apresentar ${meta.term}</button>
     </div>
 
     <div style="margin-top:14px;display:flex;justify-content:center;">
       <button class="btn btn-ghost btn-sm" onclick="openModal({type:'finalize'})">Finalizar ${meta.term}</button>
-    </div>
+    </div>` : ''}
   </div>`;
 }
 
@@ -1141,6 +1290,7 @@ function renderDetailModal(){
         <button class="modal-close" onclick="closeModal()">✕</button>
       </div>
       <div class="modal-body">
+        ${s.originContext==='quinzenal' ? `<div class="origin-tag" style="margin-bottom:12px;" onclick="closeModal(); goToOrigin('${s.originSubjectId}')" title="Ver reunião de origem">↩ Origem: ${escapeHtml(s.originLabel)}</div>` : ''}
         <div class="detail-status-row">
           <span class="badge" style="color:${st.color};background:${st.bg};border:1px solid ${st.border}">${s.status}</span>
           ${cIcon ? `<span class="class-tag">${cIcon} ${s.classification}</span>` : ''}
@@ -1170,7 +1320,10 @@ function renderDetailModal(){
       </div>
       <div class="modal-foot split">
         <button class="btn btn-danger" onclick="if(confirm('Excluir este assunto definitivamente?')){ deleteSubject('${s.id}'); closeModal(); }">Excluir</button>
-        <button class="btn btn-primary" onclick="openModal({type:'form', id:'${s.id}'})">Editar</button>
+        <div style="display:flex;gap:10px;">
+          ${activeContext==='quinzenal' ? `<button class="btn btn-ghost" onclick="selectedForCheckpoint = new Set(['${s.id}']); openModal({type:'addtocheckpoint'})">Adicionar ao Checkpoint</button>` : ''}
+          <button class="btn btn-primary" onclick="openModal({type:'form', id:'${s.id}'})">Editar</button>
+        </div>
       </div>
     </div>
   </div>`;
@@ -1228,6 +1381,70 @@ function submitEditDate(){
   saveState();
   closeModal();
   showToast('Data corrigida com sucesso.');
+}
+
+let checkpointCopyResult = null; // resultado da última cópia, exibido como confirmação no modal
+
+function renderAddToCheckpointModal(){
+  const cp = state.contexts.checkpoint;
+  const ids = [...selectedForCheckpoint];
+  const titles = ids.map(id=>getSubject(id)).filter(Boolean).map(s=>s.title);
+
+  if(checkpointCopyResult){
+    const r = checkpointCopyResult;
+    return `
+    <div class="overlay" onclick="if(event.target===this){ checkpointCopyResult=null; closeModal(); }">
+      <div class="modal" style="max-width:440px;">
+        <div class="modal-head"><h2>Adicionado ao Checkpoint</h2><button class="modal-close" onclick="checkpointCopyResult=null; closeModal();">✕</button></div>
+        <div class="modal-body">
+          ${r.added.length ? `
+            <p style="margin:0 0 6px 0;font-size:14px;"><strong>${r.added.length}</strong> assunto${r.added.length===1?'':'s'} adicionado${r.added.length===1?'':'s'} ao Checkpoint de <strong>${fmtDate(r.checkpointDate)}</strong>:</p>
+            <ul style="margin:0 0 14px 0;padding-left:18px;font-size:13.5px;color:var(--text);">
+              ${r.added.map(t=>`<li>${escapeHtml(t)}</li>`).join('')}
+            </ul>` : ''}
+          ${r.skipped.length ? `
+            <p style="margin:0 0 6px 0;font-size:13.5px;color:var(--muted);">Já estavam neste Checkpoint e foram ignorados:</p>
+            <ul style="margin:0;padding-left:18px;font-size:13.5px;color:var(--muted);">
+              ${r.skipped.map(t=>`<li>${escapeHtml(t)}</li>`).join('')}
+            </ul>` : ''}
+          ${(!r.added.length && !r.skipped.length) ? `<p style="margin:0;font-size:14px;color:var(--muted);">Nenhum assunto processado.</p>` : ''}
+        </div>
+        <div class="modal-foot">
+          <button class="btn btn-primary" onclick="checkpointCopyResult=null; closeModal(); toggleSelectionMode();">Concluir</button>
+        </div>
+      </div>
+    </div>`;
+  }
+
+  return `
+  <div class="overlay" onclick="if(event.target===this) closeModal()">
+    <div class="modal" style="max-width:460px;">
+      <div class="modal-head"><h2>Adicionar ao Checkpoint</h2><button class="modal-close" onclick="closeModal()">✕</button></div>
+      <div class="modal-body">
+        <p style="margin:0 0 10px 0;font-size:14px;"><strong>${titles.length}</strong> assunto${titles.length===1?'':'s'} selecionado${titles.length===1?'':'s'}:</p>
+        <ul style="margin:0 0 16px 0;padding-left:18px;font-size:13.5px;color:var(--text);max-height:120px;overflow-y:auto;">
+          ${titles.map(t=>`<li>${escapeHtml(t)}</li>`).join('')}
+        </ul>
+        <div class="field">
+          <label>Data do Checkpoint de destino</label>
+          <input type="date" id="atc-date" value="${cp.current.date}">
+          <p class="hint">Se essa data ainda não tiver um Checkpoint, um novo será iniciado automaticamente. O Checkpoint atual (${fmtDate(cp.current.date)}) é reaproveitado quando a data coincide.</p>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
+        <button class="btn btn-primary" onclick="submitAddToCheckpoint()">Adicionar selecionados</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function submitAddToCheckpoint(){
+  const date = document.getElementById('atc-date').value || todayISO();
+  const ids = [...selectedForCheckpoint];
+  if(!ids.length){ closeModal(); return; }
+  checkpointCopyResult = copySubjectsToCheckpoint(ids, date);
+  render();
 }
 
 function renderEditDateModal(){
@@ -1424,6 +1641,7 @@ function render(){
     else if(modal.type==='detail') modalHtml = renderDetailModal();
     else if(modal.type==='finalize') modalHtml = renderFinalizeModal();
     else if(modal.type==='newmeeting') modalHtml = renderNewMeetingModal();
+    else if(modal.type==='addtocheckpoint') modalHtml = renderAddToCheckpointModal();
     else if(modal.type==='editdate') modalHtml = renderEditDateModal();
     else if(modal.type==='settings') modalHtml = renderSettingsModal();
   }
