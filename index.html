@@ -60,7 +60,9 @@
     font-size:12.5px;color:#dfe9f3;background:rgba(255,255,255,.08);
     border:1px solid rgba(255,255,255,.16);
     padding:5px 12px;border-radius:20px;margin-top:8px;display:inline-block;
+    font-family:inherit;transition:background .15s ease;
   }
+  button.meeting-chip:hover{background:rgba(255,255,255,.18);border-color:rgba(255,255,255,.3);}
   nav.topnav{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
   .context-switch{
     display:flex;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.2);
@@ -730,7 +732,7 @@ function renderHeader(){
         <div class="brand-text">
           <h1>Acompanhamento Técnico</h1>
           <p>${meta.subtitle}</p>
-          <span class="meeting-chip">${meta.chipLabel} • ${fmtDate(ctxData().current.date)}</span>
+          <button class="meeting-chip" onclick="openModal({type:'editdate'})" title="Clique para corrigir a data">${meta.chipLabel} • ${fmtDate(ctxData().current.date)} ✎</button>
         </div>
       </div>
       <nav class="topnav">
@@ -1091,6 +1093,36 @@ function submitNewMeeting(copyPrev){
   setView('home');
 }
 
+function submitEditDate(){
+  const date = document.getElementById('ed-date').value;
+  if(!date){ showToast('Informe uma data válida.'); return; }
+  ctxData().current.date = date;
+  saveState();
+  closeModal();
+  showToast('Data corrigida com sucesso.');
+}
+
+function renderEditDateModal(){
+  const meta = contextMeta();
+  return `
+  <div class="overlay" onclick="if(event.target===this) closeModal()">
+    <div class="modal" style="max-width:380px;">
+      <div class="modal-head"><h2>Corrigir data</h2><button class="modal-close" onclick="closeModal()">✕</button></div>
+      <div class="modal-body">
+        <div class="field">
+          <label>Data d${meta.term==='checkpoint'?'o':'a'} ${meta.term} atual</label>
+          <input type="date" id="ed-date" value="${ctxData().current.date}">
+        </div>
+        <p class="hint">Isso corrige apenas a data ${meta.term==='checkpoint'?'do checkpoint':'da reunião'} em andamento — não afeta o histórico já salvo.</p>
+      </div>
+      <div class="modal-foot">
+        <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
+        <button class="btn btn-primary" onclick="submitEditDate()">Salvar data</button>
+      </div>
+    </div>
+  </div>`;
+}
+
 function renderSettingsModal(){
   const meta = contextMeta();
   return `
@@ -1264,6 +1296,7 @@ function render(){
     else if(modal.type==='detail') modalHtml = renderDetailModal();
     else if(modal.type==='finalize') modalHtml = renderFinalizeModal();
     else if(modal.type==='newmeeting') modalHtml = renderNewMeetingModal();
+    else if(modal.type==='editdate') modalHtml = renderEditDateModal();
     else if(modal.type==='settings') modalHtml = renderSettingsModal();
   }
 
