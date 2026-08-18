@@ -150,6 +150,14 @@
   .subject-card.attention::before{
     content:"";position:absolute;top:0;left:0;width:5px;height:100%;background:var(--problema);
   }
+  .subject-card.dragging{opacity:.4;}
+  .subject-card.drag-over{border-color:var(--orange);box-shadow:0 0 0 2px var(--orange-soft2) inset, 0 4px 14px rgba(0,20,40,.08);}
+  .drag-handle{
+    flex-shrink:0;width:16px;text-align:center;color:var(--muted);font-size:16px;line-height:1;
+    cursor:grab;user-select:none;margin-top:4px;letter-spacing:-2px;
+  }
+  .drag-handle:active{cursor:grabbing;}
+  .subject-card:hover .drag-handle{color:var(--navy);}
   .dot{width:11px;height:11px;border-radius:50%;flex-shrink:0;margin-top:6px;}
   .dot.red{background:var(--problema);}
   .dot.orange{background:var(--alerta);}
@@ -561,6 +569,39 @@ function computeEvolution(){
   return evo;
 }
 
+/* Ordenação manual dos assuntos: agrupa por "bucket" (atenção/normal/resolvido) e depois
+   por classificação (ordem fixa), respeitando dentro de cada classificação a ordem manual
+   definida pelo usuário via arrastar-e-soltar (campo subject.order). */
+function bucketRank(s){ return isAttention(s) ? 0 : (isResolvedStatus(s.status) ? 2 : 1); }
+function classRank(s){ const i = CLASS_LIST.indexOf(s.classification); return i===-1 ? 99 : i; }
+function getOrderedSubjects(){
+  const cur = getCurrentSubjects();
+  return [...cur].sort((a,b)=>{
+    const rb = bucketRank(a) - bucketRank(b);
+    if(rb !== 0) return rb;
+    const cb = classRank(a) - classRank(b);
+    if(cb !== 0) return cb;
+    const oa = (typeof a.order === 'number') ? a.order : 999999;
+    const ob = (typeof b.order === 'number') ? b.order : 999999;
+    return oa - ob;
+  });
+}
+/* Migração leve: garante que todo assunto tenha um número de ordem manual dentro da sua classificação */
+function ensureSubjectOrder(subjectsArr){
+  const counters = {};
+  subjectsArr.forEach(s=>{
+    const c = s.classification || 'Normal';
+    if(typeof s.order !== 'number'){
+      counters[c] = (counters[c] === undefined) ? 0 : counters[c];
+      s.order = counters[c]++;
+    } else {
+      counters[c] = Math.max((counters[c] === undefined) ? -1 : counters[c], s.order + 1);
+    }
+  });
+}
+ensureSubjectOrder(state.contexts.quinzenal.subjects);
+ensureSubjectOrder(state.contexts.checkpoint.subjects);
+
 function counts(){
   const cur = getCurrentSubjects();
   return {
@@ -601,6 +642,11 @@ function showToast(msg){
 /* ============================================================
    Ações de CRUD
    ============================================================ */
+function nextOrderForClassification(cls){
+  const siblings = ctxData().subjects.filter(s=>s.classification===cls);
+  return siblings.reduce((max,s)=> typeof s.order==='number' ? Math.max(max, s.order+1) : max, 0);
+}
+
 function upsertSubject(data, id){
   const isNew = !id;
   if(isNew){
@@ -611,6 +657,7 @@ function upsertSubject(data, id){
       forecast:data.forecast, lastUpdate:data.lastUpdate,
       whatChanged:data.whatChanged, whatToHighlight:data.whatToHighlight, note:data.note,
       createdAt: todayISO(),
+      order: nextOrderForClassification(data.classification),
       timeline:[{date:fmtDate(data.lastUpdate)||fmtDate(todayISO()), text:data.whatChanged || 'Assunto cadastrado.'}]
     };
     ctxData().subjects.push(s);
@@ -618,8 +665,13 @@ function upsertSubject(data, id){
     showToast('Assunto cadastrado.');
   } else {
     const s = getSubject(id);
+    const classificationChanged = s.classification !== data.classification;
     const changed = (s.whatChanged !== data.whatChanged) || (s.lastUpdate !== data.lastUpdate) || (s.status !== data.status);
     Object.assign(s, data);
+    if(classificationChanged){
+      // ao mudar de classificação, o assunto vai para o final da nova classificação
+      s.order = nextOrderForClassification(data.classification);
+    }
     if(changed){
       s.timeline.unshift({date:fmtDate(data.lastUpdate)||fmtDate(todayISO()), text:data.whatChanged || ('Status atualizado para ' + data.status + '.')});
       s.timeline = s.timeline.slice(0,12);
@@ -757,7 +809,16 @@ function subjectCard(s){
   const st = STATUS_STYLE[s.status] || STATUS_STYLE['Pendente'];
   const cIcon = CLASS_ICON[s.classification] || '';
   return `
-  <div class="subject-card ${isAttention(s)?'attention':''}" onclick="openModal({type:'detail', id:'${s.id}'})">
+  <div class="subject-card ${isAttention(s)?'attention':''}"
+       draggable="true"
+       data-id="${s.id}"
+       onclick="handleSubjectClick(event,'${s.id}')"
+       ondragstart="onSubjectDragStart(event,'${s.id}')"
+       ondragover="onSubjectDragOver(event,'${s.id}')"
+       ondragleave="onSubjectDragLeave(event)"
+       ondrop="onSubjectDrop(event,'${s.id}')"
+       ondragend="onSubjectDragEnd(event)">
+    <div class="drag-handle" title="Arrastar para reordenar dentro de '${escapeHtml(s.classification)}'">⠿</div>
     <div class="dot ${dotColor(s)}"></div>
     <div class="subject-main">
       <div class="subject-top">
@@ -774,14 +835,81 @@ function subjectCard(s){
   </div>`;
 }
 
+/* ---------- Arrastar e soltar (reordenação manual dentro da mesma classificação) ---------- */
+let dragState = null;
+let suppressCardClick = false;
+
+function handleSubjectClick(event, id){
+  if(suppressCardClick){ suppressCardClick = false; return; }
+  openModal({type:'detail', id});
+}
+
+function onSubjectDragStart(e, id){
+  const s = getSubject(id);
+  if(!s) return;
+  dragState = { id, classification: s.classification };
+  suppressCardClick = true;
+  try{ e.dataTransfer.setData('text/plain', id); }catch(err){}
+  e.dataTransfer.effectAllowed = 'move';
+  e.currentTarget.classList.add('dragging');
+}
+
+function onSubjectDragOver(e, overId){
+  if(!dragState || overId === dragState.id) return;
+  const overSubject = getSubject(overId);
+  if(!overSubject || overSubject.classification !== dragState.classification){
+    e.dataTransfer.dropEffect = 'none';
+    return; // classificação diferente: não permite soltar aqui
+  }
+  e.preventDefault();
+  e.dataTransfer.dropEffect = 'move';
+  e.currentTarget.classList.add('drag-over');
+}
+
+function onSubjectDragLeave(e){
+  e.currentTarget.classList.remove('drag-over');
+}
+
+function onSubjectDrop(e, overId){
+  e.preventDefault();
+  document.querySelectorAll('.subject-card.drag-over').forEach(el=>el.classList.remove('drag-over'));
+  if(!dragState) return;
+  const draggedId = dragState.id;
+  dragState = null;
+  if(draggedId === overId) return;
+  const dragged = getSubject(draggedId);
+  const target = getSubject(overId);
+  if(!dragged || !target || dragged.classification !== target.classification){
+    showToast('Só é possível reordenar assuntos dentro da mesma classificação.');
+    return;
+  }
+  reorderWithinClassification(draggedId, overId);
+}
+
+function onSubjectDragEnd(e){
+  e.currentTarget.classList.remove('dragging');
+  document.querySelectorAll('.subject-card.drag-over').forEach(el=>el.classList.remove('drag-over'));
+  dragState = null;
+  setTimeout(()=>{ suppressCardClick = false; }, 0);
+}
+
+function reorderWithinClassification(draggedId, targetId){
+  const cls = getSubject(draggedId).classification;
+  const group = getOrderedSubjects().filter(s=>s.classification===cls);
+  const fromIdx = group.findIndex(s=>s.id===draggedId);
+  const toIdx = group.findIndex(s=>s.id===targetId);
+  if(fromIdx===-1 || toIdx===-1) return;
+  const [moved] = group.splice(fromIdx,1);
+  group.splice(toIdx,0,moved);
+  group.forEach((s,i)=>{ s.order = i; });
+  saveState();
+  render();
+}
+
 function renderHome(){
   const c = counts();
   const evo = computeEvolution();
-  const cur = getCurrentSubjects();
-  const sorted = [...cur].sort((a,b)=>{
-    const rank = s => isAttention(s) ? 0 : (isResolvedStatus(s.status) ? 2 : 1);
-    return rank(a)-rank(b);
-  });
+  const sorted = getOrderedSubjects();
   const meta = contextMeta();
 
   return `
@@ -806,7 +934,7 @@ function renderHome(){
     <div class="section-head">
       <div>
         <div class="section-title">Assuntos em acompanhamento
-          <small>${meta.termCap} de ${fmtDate(ctxData().current.date)}</small>
+          <small>${meta.termCap} de ${fmtDate(ctxData().current.date)} • arraste ⠿ para reordenar dentro da mesma classificação</small>
         </div>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
@@ -1155,7 +1283,7 @@ function renderSettingsModal(){
 function buildSlides(){
   const c = counts();
   const evo = computeEvolution();
-  const cur = getCurrentSubjects();
+  const cur = getOrderedSubjects();
   const attention = cur.filter(isAttention);
   const rootCause = cur.filter(s=>!isAttention(s) && (s.classification==='Causa raiz' || s.classification==='Recorrente' || s.status==='Resolvido - Causa Raiz'));
   const resolved = cur.filter(s=>isResolvedStatus(s.status) && !rootCause.includes(s));
