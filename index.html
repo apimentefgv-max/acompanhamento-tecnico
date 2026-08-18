@@ -61,7 +61,17 @@
     border:1px solid rgba(255,255,255,.16);
     padding:5px 12px;border-radius:20px;margin-top:8px;display:inline-block;
   }
-  nav.topnav{display:flex;gap:8px;flex-wrap:wrap;}
+  nav.topnav{display:flex;gap:8px;flex-wrap:wrap;align-items:center;}
+  .context-switch{
+    display:flex;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.2);
+    border-radius:9px;padding:3px;gap:2px;margin-right:4px;
+  }
+  .context-switch button{
+    background:transparent;border:none;color:#dfe9f3;padding:8px 13px;border-radius:7px;
+    font-size:12.5px;font-weight:700;white-space:nowrap;transition:background .15s ease,color .15s ease;
+  }
+  .context-switch button:hover{background:rgba(255,255,255,.12);}
+  .context-switch button.active{background:var(--white);color:var(--navy);}
   .nav-btn{
     background:rgba(255,255,255,.08);
     border:1px solid rgba(255,255,255,.18);
@@ -336,7 +346,7 @@ function fmtDateLong(iso){
   return d + ' de ' + meses[m-1] + ' de ' + y;
 }
 
-function seedState(){
+function seedQuinzenalData(){
   const subjects = [
     {
       id:'s1', ticket:'731639', title:'Associação de contas ainda apresenta problemas',
@@ -441,18 +451,69 @@ function seedState(){
   };
 }
 
+/* Checkpoints começam vazios — trilha de dados totalmente independente da quinzenal */
+function seedCheckpointData(){
+  return {
+    subjects: [],
+    meetings: [],
+    current: { date: todayISO(), subjectIds: [] }
+  };
+}
+
+function freshMultiContextState(){
+  return {
+    contexts: {
+      quinzenal: seedQuinzenalData(),
+      checkpoint: seedCheckpointData()
+    }
+  };
+}
+
 function loadState(){
   try{
     const raw = localStorage.getItem(STORAGE_KEY);
-    if(!raw) return seedState();
+    if(!raw) return freshMultiContextState();
     const parsed = JSON.parse(raw);
-    if(!parsed || !parsed.subjects) return seedState();
-    return parsed;
+    if(!parsed) return freshMultiContextState();
+
+    // Já está no formato novo (com contextos separados)
+    if(parsed.contexts){
+      if(!parsed.contexts.quinzenal) parsed.contexts.quinzenal = seedQuinzenalData();
+      if(!parsed.contexts.checkpoint) parsed.contexts.checkpoint = seedCheckpointData();
+      return parsed;
+    }
+
+    // Formato antigo (anterior à separação Quinzenal/Checkpoint): migrar preservando os dados
+    if(parsed.subjects && parsed.meetings && parsed.current){
+      return {
+        contexts: {
+          quinzenal: { subjects: parsed.subjects, meetings: parsed.meetings, current: parsed.current },
+          checkpoint: seedCheckpointData()
+        }
+      };
+    }
+    return freshMultiContextState();
   }catch(e){
-    return seedState();
+    return freshMultiContextState();
   }
 }
 let state = loadState();
+let activeContext = 'quinzenal'; // comportamento de entrada preservado: abre direto nas Reuniões Quinzenais
+function ctxData(){ return state.contexts[activeContext]; }
+function switchContext(ctx){
+  if(ctx !== 'quinzenal' && ctx !== 'checkpoint') return;
+  activeContext = ctx;
+  view = 'home';
+  modal = null;
+  presentSlides = [];
+  render();
+  window.scrollTo(0,0);
+}
+function contextMeta(){
+  return activeContext === 'checkpoint'
+    ? { subtitle:'Acompanhamento semanal dos assuntos em andamento', chipLabel:'Checkpoint semanal', screenTitle:'Checkpoints', navLabel:'Checkpoints', homeLabel:'Checkpoint atual', term:'checkpoint', termCap:'Checkpoint' }
+    : { subtitle:'Pauta e acompanhamento das principais demandas de produção', chipLabel:'Reunião quinzenal', screenTitle:'Reuniões Quinzenais', navLabel:'Reuniões', homeLabel:'Reunião atual', term:'reunião', termCap:'Reunião' };
+}
 function saveState(){
   try{
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
@@ -464,13 +525,13 @@ function saveState(){
 /* ============================================================
    Helpers de domínio
    ============================================================ */
-function getSubject(id){ return state.subjects.find(s=>s.id===id); }
+function getSubject(id){ return ctxData().subjects.find(s=>s.id===id); }
 function getCurrentSubjects(){
-  return state.current.subjectIds.map(getSubject).filter(Boolean);
+  return ctxData().current.subjectIds.map(getSubject).filter(Boolean);
 }
 function isResolvedStatus(status){ return status && status.indexOf('Resolvido') === 0; }
 function isAttention(s){ return s.classification === 'Ponto de atenção'; }
-function lastMeeting(){ return state.meetings.length ? state.meetings[state.meetings.length-1] : null; }
+function lastMeeting(){ const m = ctxData().meetings; return m.length ? m[m.length-1] : null; }
 
 function dotColor(s){
   if(isResolvedStatus(s.status)) return 'green';
@@ -550,8 +611,8 @@ function upsertSubject(data, id){
       createdAt: todayISO(),
       timeline:[{date:fmtDate(data.lastUpdate)||fmtDate(todayISO()), text:data.whatChanged || 'Assunto cadastrado.'}]
     };
-    state.subjects.push(s);
-    state.current.subjectIds.push(s.id);
+    ctxData().subjects.push(s);
+    ctxData().current.subjectIds.push(s.id);
     showToast('Assunto cadastrado.');
   } else {
     const s = getSubject(id);
@@ -567,29 +628,35 @@ function upsertSubject(data, id){
 }
 
 function deleteSubject(id){
-  state.subjects = state.subjects.filter(s=>s.id!==id);
-  state.current.subjectIds = state.current.subjectIds.filter(x=>x!==id);
+  ctxData().subjects = ctxData().subjects.filter(s=>s.id!==id);
+  ctxData().current.subjectIds = ctxData().current.subjectIds.filter(x=>x!==id);
   saveState();
   showToast('Assunto excluído.');
 }
 
 function finalizeMeeting(){
   const items = getCurrentSubjects().map(s=>({...s, timeline:[...s.timeline]}));
-  state.meetings.push({ id: uid('m'), date: state.current.date, items });
+  ctxData().meetings.push({ id: uid('m'), date: ctxData().current.date, items });
   saveState();
-  showToast('Reunião salva no histórico.');
+  showToast(contextMeta().termCap + ' salvo(a) no histórico.');
+}
+
+function deleteMeeting(id){
+  ctxData().meetings = ctxData().meetings.filter(m=>m.id!==id);
+  saveState();
+  showToast(contextMeta().termCap + ' excluído(a) do histórico.');
 }
 
 function startNewMeeting(dateISO, copyFromPrevious){
   if(copyFromPrevious){
     const prev = lastMeeting();
     if(prev){
-      state.current.subjectIds = prev.items.map(i=>i.id).filter(id=>getSubject(id));
+      ctxData().current.subjectIds = prev.items.map(i=>i.id).filter(id=>getSubject(id));
     }
   }
-  state.current.date = dateISO;
+  ctxData().current.date = dateISO;
   saveState();
-  showToast('Nova reunião criada.');
+  showToast('Novo(a) ' + contextMeta().term + ' criado(a).');
 }
 
 function exportBackup(){
@@ -609,8 +676,20 @@ function importBackup(file){
   reader.onload = (e) => {
     try{
       const parsed = JSON.parse(e.target.result);
-      if(!parsed.subjects || !parsed.current) throw new Error('formato inválido');
-      state = parsed;
+      if(parsed && parsed.contexts && parsed.contexts.quinzenal && parsed.contexts.checkpoint){
+        state = parsed;
+      } else if(parsed && parsed.subjects && parsed.current){
+        // Backup no formato antigo (anterior à separação Quinzenal/Checkpoint):
+        // migra para "Reuniões Quinzenais" e preserva os Checkpoints já existentes.
+        state = {
+          contexts: {
+            quinzenal: { subjects: parsed.subjects, meetings: parsed.meetings || [], current: parsed.current },
+            checkpoint: (state && state.contexts && state.contexts.checkpoint) ? state.contexts.checkpoint : seedCheckpointData()
+          }
+        };
+      } else {
+        throw new Error('formato inválido');
+      }
       saveState();
       closeModal();
       setView('home');
@@ -622,21 +701,26 @@ function importBackup(file){
   reader.readAsText(file);
 }
 function resetDemoData(){
-  state = seedState();
+  if(activeContext === 'checkpoint'){
+    state.contexts.checkpoint = seedCheckpointData();
+  } else {
+    state.contexts.quinzenal = seedQuinzenalData();
+  }
   saveState();
   closeModal();
   setView('home');
-  showToast('Dados de demonstração restaurados.');
+  showToast('Dados de demonstração de "' + contextMeta().screenTitle + '" restaurados.');
 }
 
 /* ============================================================
    Render — cabeçalho
    ============================================================ */
 function renderHeader(){
+  const meta = contextMeta();
   const items = [
-    {v:'home', label:'Reunião atual', icon:'📋'},
+    {v:'home', label:meta.homeLabel, icon:'📋'},
     {v:'attention', label:'Pontos de atenção', icon:'🔺'},
-    {v:'meetings', label:'Reuniões', icon:'🗂'},
+    {v:'meetings', label:meta.navLabel, icon:'🗂'},
   ];
   return `
   <header class="topbar">
@@ -645,11 +729,15 @@ function renderHeader(){
         <img class="brand-logo" src="${FGV_LOGO}" alt="FGV">
         <div class="brand-text">
           <h1>Acompanhamento Técnico</h1>
-          <p>Pauta e acompanhamento das principais demandas de produção</p>
-          <span class="meeting-chip">Reunião quinzenal • ${fmtDate(state.current.date)}</span>
+          <p>${meta.subtitle}</p>
+          <span class="meeting-chip">${meta.chipLabel} • ${fmtDate(ctxData().current.date)}</span>
         </div>
       </div>
       <nav class="topnav">
+        <div class="context-switch">
+          <button class="${activeContext==='quinzenal'?'active':''}" onclick="switchContext('quinzenal')" title="Reuniões Quinzenais">📅 Quinzenal</button>
+          <button class="${activeContext==='checkpoint'?'active':''}" onclick="switchContext('checkpoint')" title="Checkpoints">✅ Checkpoint</button>
+        </div>
         ${items.map(i=>`
           <button class="nav-btn ${view===i.v?'active':''}" onclick="setView('${i.v}')">
             <span>${i.icon}</span><span class="nav-label">${i.label}</span>
@@ -692,6 +780,7 @@ function renderHome(){
     const rank = s => isAttention(s) ? 0 : (isResolvedStatus(s.status) ? 2 : 1);
     return rank(a)-rank(b);
   });
+  const meta = contextMeta();
 
   return `
   <div class="wrap">
@@ -703,7 +792,7 @@ function renderHome(){
     </div>
 
     <div class="section-head">
-      <div class="section-title">Desde a última reunião</div>
+      <div class="section-title">Desde ${meta.term==='checkpoint' ? 'o último' : 'a última'} ${meta.term}</div>
     </div>
     <div class="evo-card">
       <div class="evo-item resolved"><span class="evo-icon">✓</span> ${evo.resolved} resolvido${evo.resolved===1?'':'s'}</div>
@@ -715,24 +804,24 @@ function renderHome(){
     <div class="section-head">
       <div>
         <div class="section-title">Assuntos em acompanhamento
-          <small>Reunião de ${fmtDate(state.current.date)}</small>
+          <small>${meta.termCap} de ${fmtDate(ctxData().current.date)}</small>
         </div>
       </div>
       <div style="display:flex;gap:8px;flex-wrap:wrap;">
-        <button class="btn btn-ghost btn-sm" onclick="openModal({type:'newmeeting'})">🗓 Nova reunião</button>
+        <button class="btn btn-ghost btn-sm" onclick="openModal({type:'newmeeting'})">🗓 Novo(a) ${meta.term}</button>
         <button class="btn btn-primary btn-sm" onclick="openModal({type:'form'})">+ Novo assunto</button>
       </div>
     </div>
 
     ${sorted.length ? `<div class="subjects-list">${sorted.map(subjectCard).join('')}</div>` :
-      `<div class="empty-state"><div class="big">🗒</div>Nenhum assunto nesta reunião ainda.<br>Cadastre o primeiro assunto para começar a pauta.</div>`}
+      `<div class="empty-state"><div class="big">🗒</div>Nenhum assunto ${meta.term==='checkpoint'?'neste checkpoint':'nesta reunião'} ainda.<br>Cadastre o primeiro assunto para começar a pauta.</div>`}
 
     <div style="margin-top:32px;display:flex;justify-content:center;">
-      <button class="btn btn-navy btn-lg" onclick="startPresentation()">▶ Apresentar reunião</button>
+      <button class="btn btn-navy btn-lg" onclick="startPresentation()">▶ Apresentar ${meta.term}</button>
     </div>
 
     <div style="margin-top:14px;display:flex;justify-content:center;">
-      <button class="btn btn-ghost btn-sm" onclick="openModal({type:'finalize'})">Finalizar reunião</button>
+      <button class="btn btn-ghost btn-sm" onclick="openModal({type:'finalize'})">Finalizar ${meta.term}</button>
     </div>
   </div>`;
 }
@@ -759,20 +848,21 @@ function renderAttention(){
    Render — Reuniões (histórico)
    ============================================================ */
 function renderMeetings(){
-  const all = [...state.meetings].reverse();
+  const all = [...ctxData().meetings].reverse();
+  const meta = contextMeta();
   return `
   <div class="wrap">
     <div class="section-head">
-      <div class="section-title">Reuniões
-        <small>Histórico de reuniões quinzenais — cada retrato é preservado como foi apresentado</small>
+      <div class="section-title">${meta.screenTitle}
+        <small>Histórico de ${meta.term==='checkpoint'?'checkpoints semanais':'reuniões quinzenais'} — cada retrato é preservado como foi apresentado</small>
       </div>
       <button class="btn btn-ghost btn-sm" onclick="setView('home')">← Voltar</button>
     </div>
 
     <div class="meeting-row current" onclick="setView('home')">
       <div>
-        <div class="m-date">${fmtDate(state.current.date)}</div>
-        <div class="m-sub">${getCurrentSubjects().length} assunto(s) • em andamento, ainda não finalizada</div>
+        <div class="m-date">${fmtDate(ctxData().current.date)}</div>
+        <div class="m-sub">${getCurrentSubjects().length} assunto(s) • em andamento, ainda não finalizado(a)</div>
       </div>
       <span class="m-badge">Atual</span>
     </div>
@@ -783,24 +873,31 @@ function renderMeetings(){
           <div class="m-date">${fmtDate(m.date)}</div>
           <div class="m-sub">${m.items.length} assunto(s)</div>
         </div>
-        <span class="m-badge">Ver pauta</span>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <span class="m-badge">Ver pauta</span>
+          <button class="btn btn-danger btn-sm" onclick="event.stopPropagation(); if(confirm('Excluir definitivamente ${meta.term==='checkpoint'?'o checkpoint':'a reunião'} de ${fmtDate(m.date)} do histórico? Esta ação não pode ser desfeita.')){ deleteMeeting('${m.id}'); render(); }">Excluir ${meta.term}</button>
+        </div>
       </div>
     `).join('') || ''}
 
-    ${!all.length ? `<div class="empty-state">Nenhuma reunião finalizada ainda.</div>` : ''}
+    ${!all.length ? `<div class="empty-state">Nenhum(a) ${meta.term} finalizado(a) ainda.</div>` : ''}
   </div>`;
 }
 
 function renderMeetingDetail(){
-  const m = state.meetings.find(x=>x.id===viewingMeetingId);
-  if(!m) return `<div class="wrap"><div class="empty-state">Reunião não encontrada.</div></div>`;
+  const m = ctxData().meetings.find(x=>x.id===viewingMeetingId);
+  const meta = contextMeta();
+  if(!m) return `<div class="wrap"><div class="empty-state">${meta.termCap} não encontrado(a).</div></div>`;
   return `
   <div class="wrap">
     <div class="section-head">
-      <div class="section-title">Reunião de ${fmtDate(m.date)}
+      <div class="section-title">${meta.termCap} de ${fmtDate(m.date)}
         <small>Retrato congelado — não é afetado por alterações posteriores nos assuntos</small>
       </div>
       <button class="btn btn-ghost btn-sm" onclick="setView('meetings')">← Voltar</button>
+    </div>
+    <div style="display:flex;justify-content:flex-end;margin-bottom:14px;">
+      <button class="btn btn-danger btn-sm" onclick="if(confirm('Excluir definitivamente ${meta.term==='checkpoint'?'o checkpoint':'a reunião'} de ${fmtDate(m.date)} do histórico? Esta ação não pode ser desfeita.')){ deleteMeeting('${m.id}'); setView('meetings'); }">Excluir ${meta.term}</button>
     </div>
     <div class="subjects-list">
       ${m.items.map(s=>{
@@ -951,13 +1048,14 @@ function renderDetailModal(){
 
 function renderFinalizeModal(){
   const c = counts();
+  const meta = contextMeta();
   return `
   <div class="overlay" onclick="if(event.target===this) closeModal()">
     <div class="modal" style="max-width:420px;">
-      <div class="modal-head"><h2>Finalizar reunião</h2><button class="modal-close" onclick="closeModal()">✕</button></div>
+      <div class="modal-head"><h2>Finalizar ${meta.term}</h2><button class="modal-close" onclick="closeModal()">✕</button></div>
       <div class="modal-body">
-        <p style="margin:0 0 8px 0;font-size:14px;">Salvar a reunião de <strong>${fmtDate(state.current.date)}</strong> no histórico?</p>
-        <p style="margin:0;font-size:13px;color:var(--muted);">Serão preservados ${c.total} assunto(s) exatamente como estão agora. Reuniões salvas não são alteradas por edições futuras.</p>
+        <p style="margin:0 0 8px 0;font-size:14px;">Salvar ${meta.term==='checkpoint'?'o checkpoint':'a reunião'} de <strong>${fmtDate(ctxData().current.date)}</strong> no histórico?</p>
+        <p style="margin:0;font-size:13px;color:var(--muted);">Serão preservados ${c.total} assunto(s) exatamente como estão agora. Registros salvos não são alterados por edições futuras.</p>
       </div>
       <div class="modal-foot">
         <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
@@ -968,17 +1066,18 @@ function renderFinalizeModal(){
 }
 
 function renderNewMeetingModal(){
+  const meta = contextMeta();
   const next = new Date();
-  next.setDate(next.getDate()+14);
+  next.setDate(next.getDate() + (meta.term==='checkpoint' ? 7 : 14));
   const nextISO = next.toISOString().slice(0,10);
   return `
   <div class="overlay" onclick="if(event.target===this) closeModal()">
     <div class="modal" style="max-width:440px;">
-      <div class="modal-head"><h2>Nova reunião</h2><button class="modal-close" onclick="closeModal()">✕</button></div>
+      <div class="modal-head"><h2>Novo(a) ${meta.term}</h2><button class="modal-close" onclick="closeModal()">✕</button></div>
       <div class="modal-body">
-        <div class="field"><label>Data da reunião</label><input type="date" id="nm-date" value="${nextISO}"></div>
-        <p class="hint" style="margin-bottom:14px;">A opção recomendada copia os assuntos ainda ativos da reunião anterior, para você apenas atualizar, remover ou adicionar itens.</p>
-        <button class="btn btn-primary btn-block" style="margin-bottom:10px;" onclick="submitNewMeeting(true)">Criar a partir da reunião anterior</button>
+        <div class="field"><label>Data d${meta.term==='checkpoint'?'o':'a'} ${meta.term}</label><input type="date" id="nm-date" value="${nextISO}"></div>
+        <p class="hint" style="margin-bottom:14px;">A opção recomendada copia os assuntos ainda ativos d${meta.term==='checkpoint'?'o':'a'} ${meta.term} anterior, para você apenas atualizar, remover ou adicionar itens.</p>
+        <button class="btn btn-primary btn-block" style="margin-bottom:10px;" onclick="submitNewMeeting(true)">Criar a partir d${meta.term==='checkpoint'?'o':'a'} anterior</button>
         <button class="btn btn-ghost btn-block" onclick="submitNewMeeting(false)">Começar em branco</button>
       </div>
     </div>
@@ -986,13 +1085,14 @@ function renderNewMeetingModal(){
 }
 function submitNewMeeting(copyPrev){
   const date = document.getElementById('nm-date').value || todayISO();
-  if(!copyPrev){ state.current.subjectIds = []; saveState(); }
+  if(!copyPrev){ ctxData().current.subjectIds = []; saveState(); }
   startNewMeeting(date, copyPrev);
   closeModal();
   setView('home');
 }
 
 function renderSettingsModal(){
+  const meta = contextMeta();
   return `
   <div class="overlay" onclick="if(event.target===this) closeModal()">
     <div class="modal" style="max-width:440px;">
@@ -1000,7 +1100,7 @@ function renderSettingsModal(){
       <div class="modal-body">
         <div class="field">
           <label>Backup dos dados</label>
-          <p class="hint" style="margin:0 0 10px 0;">Os dados ficam salvos apenas neste navegador. Exporte um backup periodicamente.</p>
+          <p class="hint" style="margin:0 0 10px 0;">O backup inclui Reuniões Quinzenais e Checkpoints juntos. Os dados ficam salvos apenas neste navegador — exporte um backup periodicamente.</p>
           <button class="btn btn-ghost btn-block" style="margin-bottom:10px;" onclick="exportBackup()">⬇ Exportar backup (.json)</button>
           <label style="display:block;">
             <span class="btn btn-ghost btn-block" style="display:flex;">⬆ Importar backup (.json)</span>
@@ -1009,8 +1109,8 @@ function renderSettingsModal(){
         </div>
         <div class="field" style="margin-top:20px;">
           <label>Dados de demonstração</label>
-          <p class="hint" style="margin:0 0 10px 0;">Restaura os assuntos de exemplo e apaga os dados atuais deste navegador.</p>
-          <button class="btn btn-danger btn-block" onclick="if(confirm('Isso substituirá todos os dados atuais pelos dados de demonstração. Continuar?')) resetDemoData()">Restaurar dados de demonstração</button>
+          <p class="hint" style="margin:0 0 10px 0;">Restaura os dados de exemplo apenas de "${meta.screenTitle}" (a aba selecionada agora). Os dados de "${meta.term==='checkpoint'?'Reuniões Quinzenais':'Checkpoints'}" não são afetados.</p>
+          <button class="btn btn-danger btn-block" onclick="if(confirm('Isso substituirá os dados atuais de \\'${meta.screenTitle}\\' pelos dados de demonstração. Continuar?')) resetDemoData()">Restaurar dados de "${meta.screenTitle}"</button>
         </div>
       </div>
     </div>
@@ -1031,7 +1131,7 @@ function buildSlides(){
   const ongoing = cur.filter(s=>!shown.has(s.id));
 
   const slides = [];
-  slides.push({type:'cover', data:{date:state.current.date, c}});
+  slides.push({type:'cover', data:{date:ctxData().current.date, c, meta:contextMeta()}});
   slides.push({type:'evolution', data:{evo}});
 
   function pushGroup(title, list){
@@ -1067,10 +1167,10 @@ function presentNav(delta){
 
 function renderPresentSlide(slide){
   if(slide.type==='cover'){
-    const {date,c} = slide.data;
+    const {date,c,meta} = slide.data;
     return `
       <div class="present-slide">
-        <div class="present-eyebrow">Reunião quinzenal</div>
+        <div class="present-eyebrow">${meta.chipLabel}</div>
         <h1>Acompanhamento Técnico</h1>
         <div class="present-date">${fmtDateLong(date)}</div>
         <div class="present-stats">
@@ -1085,7 +1185,7 @@ function renderPresentSlide(slide){
     const {evo} = slide.data;
     return `
       <div class="present-slide">
-        <h2>Evolução da quinzena</h2>
+        <h2>Evolução ${contextMeta().term==='checkpoint' ? 'da semana' : 'da quinzena'}</h2>
         <div class="present-evo-list">
           <div class="pe-item"><span class="pe-icon">✓</span> ${evo.resolved} resolvido${evo.resolved===1?'':'s'}</div>
           <div class="pe-item"><span class="pe-icon">+</span> ${evo.new} novo${evo.new===1?'':'s'}</div>
