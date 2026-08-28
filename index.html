@@ -807,11 +807,11 @@ function goToOrigin(originSubjectId){
   showToast('Não foi possível localizar a reunião de origem (o assunto pode ter sido excluído).');
 }
 
-function finalizeMeeting(){
+function finalizeMeeting(silent){
   const items = getCurrentSubjects().map(s=>({...s, timeline:[...s.timeline]}));
   ctxData().meetings.push({ id: uid('m'), date: ctxData().current.date, items });
   saveState();
-  showToast(contextMeta().termCap + ' salvo(a) no histórico.');
+  if(!silent) showToast(contextMeta().termCap + ' salvo(a) no histórico.');
 }
 
 function deleteMeeting(id){
@@ -820,16 +820,51 @@ function deleteMeeting(id){
   showToast(contextMeta().termCap + ' excluído(a) do histórico.');
 }
 
+/* Assuntos "órfãos": existem na lista viva de assuntos, mas não estão nem na reunião
+   atual, nem em nenhuma reunião já arquivada. Isso pode acontecer se uma reunião foi
+   substituída por "Nova reunião" antes de ser finalizada (bug corrigido nesta versão).
+   Esta checagem permite recuperar esses dados em vez de deixá-los invisíveis. */
+function findOrphanSubjects(){
+  const cur = ctxData().current;
+  const inCurrent = new Set(cur.subjectIds);
+  const inMeetings = new Set();
+  ctxData().meetings.forEach(m=>m.items.forEach(it=>inMeetings.add(it.id)));
+  return ctxData().subjects.filter(s=>!inCurrent.has(s.id) && !inMeetings.has(s.id));
+}
+function recoverOrphanSubjects(){
+  const orphans = findOrphanSubjects();
+  if(!orphans.length){ showToast('Nenhum assunto órfão encontrado.'); return; }
+  orphans.forEach(s=>ctxData().current.subjectIds.push(s.id));
+  saveState();
+  closeModal();
+  setView('home');
+  showToast(orphans.length + ' assunto(s) recuperado(s) e adicionado(s) à ' + contextMeta().term + ' atual.');
+}
+
 function startNewMeeting(dateISO, copyFromPrevious){
+  const cur = ctxData().current;
+  const last = lastMeeting();
+  const alreadySaved = last && last.date === cur.date;
+
+  // Arquiva automaticamente a reunião em andamento se ela ainda não foi finalizada,
+  // para que nenhum dado seja perdido/sobrescrito ao iniciar uma nova.
+  let autoArchived = false;
+  if(cur.subjectIds.length && !alreadySaved){
+    finalizeMeeting(true);
+    autoArchived = true;
+  }
+
   if(copyFromPrevious){
-    const prev = lastMeeting();
-    if(prev){
-      ctxData().current.subjectIds = prev.items.map(i=>i.id).filter(id=>getSubject(id));
-    }
+    const prev = lastMeeting(); // após o arquivamento acima, é sempre a reunião mais recente correta
+    ctxData().current.subjectIds = prev ? prev.items.map(i=>i.id).filter(id=>getSubject(id)) : [];
+  } else {
+    ctxData().current.subjectIds = [];
   }
   ctxData().current.date = dateISO;
   saveState();
-  showToast('Novo(a) ' + contextMeta().term + ' criado(a).');
+  showToast(autoArchived
+    ? contextMeta().termCap + ' anterior arquivado(a) automaticamente e novo(a) ' + contextMeta().term + ' criado(a).'
+    : 'Novo(a) ' + contextMeta().term + ' criado(a).');
 }
 
 function exportBackup(){
@@ -1370,7 +1405,6 @@ function renderNewMeetingModal(){
 }
 function submitNewMeeting(copyPrev){
   const date = document.getElementById('nm-date').value || todayISO();
-  if(!copyPrev){ ctxData().current.subjectIds = []; saveState(); }
   startNewMeeting(date, copyPrev);
   closeModal();
   setView('home');
@@ -1472,11 +1506,21 @@ function renderEditDateModal(){
 
 function renderSettingsModal(){
   const meta = contextMeta();
+  const orphans = findOrphanSubjects();
   return `
   <div class="overlay" onclick="if(event.target===this) closeModal()">
     <div class="modal" style="max-width:440px;">
       <div class="modal-head"><h2>Configurações</h2><button class="modal-close" onclick="closeModal()">✕</button></div>
       <div class="modal-body">
+        ${orphans.length ? `
+        <div class="field" style="background:var(--orange-soft);border:1px solid var(--orange-soft2);border-radius:8px;padding:12px 14px;margin-bottom:18px;">
+          <label style="color:var(--orange);">⚠ Assuntos não vinculados encontrados</label>
+          <p class="hint" style="margin:0 0 10px 0;">Foram encontrados <strong>${orphans.length}</strong> assunto(s) de "${meta.screenTitle}" que não aparecem nem na ${meta.term} atual, nem em nenhum histórico salvo — provavelmente por uma ${meta.term} anterior que foi substituída antes de ser finalizada. Você pode recuperá-los para a ${meta.term} atual.</p>
+          <ul style="margin:0 0 10px 0;padding-left:18px;font-size:12.5px;color:var(--muted);max-height:100px;overflow-y:auto;">
+            ${orphans.map(s=>`<li>${escapeHtml(s.title)}</li>`).join('')}
+          </ul>
+          <button class="btn btn-primary btn-block" onclick="recoverOrphanSubjects()">Recuperar para a ${meta.term} atual</button>
+        </div>` : ''}
         <div class="field">
           <label>Backup dos dados</label>
           <p class="hint" style="margin:0 0 10px 0;">O backup inclui Reuniões Quinzenais e Checkpoints juntos. Os dados ficam salvos apenas neste navegador — exporte um backup periodicamente.</p>
